@@ -66,7 +66,7 @@ class CartesiaTTSEntity(TextToSpeechEntity):
         """Generování audia s tichem na začátku."""
         voice_id = options.get("voice", self._voice_id)
         speed = options.get("speed", self._speed)
-        model = options.get("model", "sonic-multilingual")
+        model = options.get("model", "sonic-3")
 
         try:
             # Pylance fix pro experimentální parametry
