@@ -56,10 +56,9 @@ def _get_form_options(voices):
     voices_options = {v["id"]: f"{v['name']} ({v['mode']})" for v in voices}
     
     default_lang = "cs" if "cs" in languages else (languages[0] if languages else "")
-    
-    # Zkusíme najít hlas pro defaultní jazyk
     default_voice = None
     if voices_options:
+        # Zkusíme najít hlas pro defaultní jazyk
         default_voice = next((v["id"] for v in voices if default_lang in (v["language"] if isinstance(v["language"], list) else [v["language"]])), list(voices_options.keys())[0])
 
     return languages, voices_options, default_lang, default_voice
@@ -131,11 +130,8 @@ class CartesiaTTSConfigFlow(config_entries.ConfigFlow, domain="cartesia_tts"):
         existing_count = len(self._async_current_entries())
         default_name = f"Cartesia {existing_count + 1}"
 
-        # Ošetření pro Pylance: Pokud by default_voice byl None (což by neměl být díky logice výše),
-        # použijeme prázdný string nebo první klíč, aby linter nekřičel.
         safe_default_voice = default_voice if default_voice else (list(voices_options.keys())[0] if voices_options else "")
 
-        # OPRAVA: Použití vol.Optional pro všechna pole, která mají 'default'
         return self.async_show_form(
             step_id="settings",
             data_schema=vol.Schema({
@@ -150,20 +146,24 @@ class CartesiaTTSConfigFlow(config_entries.ConfigFlow, domain="cartesia_tts"):
     @callback
     def async_get_options_flow(config_entry):
         """Umožní upravit existující entitu (změnit hlas)."""
-        return CartesiaTTSOptionsFlow(config_entry)
+        # OPRAVA: Nepředáváme config_entry jako argument, OptionsFlow si ho vezme sám
+        return CartesiaTTSOptionsFlow()
 
 
 class CartesiaTTSOptionsFlow(config_entries.OptionsFlow):
     """Konfigurace (úprava) již existující entity."""
-
-    def __init__(self, config_entry):
-        self.config_entry = config_entry
+    
+    # OPRAVA: Odstraněn __init__, self.config_entry je nyní property v rodičovské třídě
 
     async def async_step_init(self, user_input=None):
         if user_input is not None:
             new_data = self.config_entry.data.copy()
             new_data.update(user_input)
             self.hass.config_entries.async_update_entry(self.config_entry, data=new_data)
+            
+            # Je nutné reloadovat entry, aby se změny projevily hned
+            await self.hass.config_entries.async_reload(self.config_entry.entry_id)
+            
             return self.async_create_entry(title="", data={})
 
         api_key = self.config_entry.data[CONF_API_KEY]
@@ -176,7 +176,6 @@ class CartesiaTTSOptionsFlow(config_entries.OptionsFlow):
         if current_voice not in voices_options and voices_options:
             current_voice = list(voices_options.keys())[0]
 
-        # OPRAVA: Použití vol.Optional pro všechna pole, která mají 'default'
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema({
