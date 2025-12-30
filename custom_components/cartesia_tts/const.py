@@ -1,0 +1,5 @@
+ATTR_MODEL = "model"
+CONF_VOICE = "voice"
+CONF_MODEL = "model"
+DOMAIN = "cartesia_tts"
+DEFAULT_MODEL = "sonic-3"
