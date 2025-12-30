@@ -7,30 +7,29 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 import os
 import json
-from .const import VOICES_CACHE_FILE, CONF_LANGUAGE
+from .const import VOICES_CACHE_FILE
 
 class CartesiaTTSEntity(TextToSpeechEntity):
     _attr_supported_options = ["voice", "model"]
-    _attr_supported_languages = ["cs", "en", "de", "es", "fr", "it", "pl", "pt", "zh", "ja"]
     
-    def __init__(self, client: AsyncCartesia, voices, default_voice_id: str, entry_id: str, language: str):
+    def __init__(self, client: AsyncCartesia, voices, voice_id: str, unique_id: str, language: str, name: str):
         self._client = client
-        self._default_voice_id = default_voice_id
+        self._voice_id = voice_id
         self._voices = voices
-        self._attr_name = "Cartesia TTS"
-        self._attr_unique_id = entry_id
+        self._attr_name = name
+        self._attr_unique_id = unique_id
         self._language = language
         
     @property
     def supported_languages(self) -> list[str]:
-        return self._attr_supported_languages
+        return [self._language]
     
     @property
     def default_language(self) -> str:
-        return "en"
+        return self._language
         
     async def async_get_tts_audio(self, message: str, language: str, options: dict) -> TtsAudioType:
-        voice_id = options.get("voice", self._default_voice_id)
+        voice_id = options.get("voice", self._voice_id)
         model = options.get("model", "sonic-3")
         try:
             audio_iter = self._client.tts.bytes(
@@ -49,45 +48,47 @@ class CartesiaTTSEntity(TextToSpeechEntity):
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities):
     data = getattr(config_entry, 'runtime_data')
-    language = config_entry.options.get(CONF_LANGUAGE, "en")
     api_key = config_entry.data[CONF_API_KEY]
-    cache_key = f"{api_key}_{language}"
-    cache_file = os.path.join(hass.config.config_dir, VOICES_CACHE_FILE)
+    entities = []
     
-    # Try to load from cache
-    voices = []
-    if os.path.exists(cache_file):
-        try:
-            with open(cache_file, "r") as f:
-                cache = json.load(f)
-                if cache.get("cache_key") == cache_key:
-                    voices_dict = cache.get("voices", {})
-                    voices = [Voice(vid, name) for vid, name in voices_dict.items()]
-        except:
-            pass
+    for i, entity_config in enumerate(data.entities):
+        language = entity_config["language"]
+        voice_id = entity_config["voice"]
+        name = entity_config["name"]
+        unique_id = f"{config_entry.entry_id}_{i}"
+        
+        # Fetch voices for this language
+        cache_file = os.path.join(hass.config.config_dir, VOICES_CACHE_FILE)
+        cache_key = api_key
+        
+        # Try to load from cache
+        voices = []
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r") as f:
+                    cache = json.load(f)
+                    if cache.get("api_key") == api_key:
+                        all_voices = cache.get("voices", [])
+                        # Filter for language
+                        for v in all_voices:
+                            langs = v["language"] if isinstance(v["language"], list) else [v["language"]]
+                            if language in langs or "multilingual" in v.get("mode", ""):
+                                voices.append(Voice(v["id"], v["name"]))
+            except:
+                pass
+        
+        if not voices:
+            # Fetch from API if not cached
+            voices_pager = await data.client.voices.list()
+            all_voices = [v async for v in voices_pager]
+            
+            for v in all_voices:
+                langs = getattr(v, "language", [])
+                if isinstance(langs, str):
+                    langs = [langs]
+                if language in langs or "multilingual" in getattr(v, "mode", ""):
+                    voices.append(Voice(getattr(v, 'id'), getattr(v, 'name')))
+        
+        entities.append(CartesiaTTSEntity(data.client, voices, voice_id, unique_id, language, name))
     
-    if not voices:
-        # Fetch from API
-        voices_pager = await data.client.voices.list()
-        all_voices = [v async for v in voices_pager]
-        
-        # Filter by language
-        filtered_voices = []
-        for v in all_voices:
-            langs = getattr(v, "language", [])
-            if isinstance(langs, str):
-                langs = [langs]
-            if language in langs or "multilingual" in getattr(v, "mode", ""):
-                filtered_voices.append(v)
-        
-        voices = [Voice(getattr(v, 'id'), getattr(v, 'name')) for v in filtered_voices]
-        
-        # Save to cache
-        voices_dict = {getattr(v, 'id'): getattr(v, 'name') for v in voices}
-        try:
-            with open(cache_file, "w") as f:
-                json.dump({"cache_key": cache_key, "voices": voices_dict}, f)
-        except:
-            pass
-    
-    async_add_entities([CartesiaTTSEntity(data.client, voices, config_entry.options.get("voice", ""), config_entry.entry_id, language)])
+    async_add_entities(entities)
