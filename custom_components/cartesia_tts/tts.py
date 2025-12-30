@@ -1,4 +1,4 @@
-from typing import Any  # <--- PŘIDÁNO PRO OPRAVU TYPOVÁNÍ
+from typing import Any
 from cartesia import AsyncCartesia
 from cartesia.core.api_error import ApiError
 from homeassistant.components.tts import TextToSpeechEntity, TtsAudioType, Voice
@@ -8,10 +8,18 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 import os
 import json
+import io
+import wave
 from .const import VOICES_CACHE_FILE
 
+# Nastavení ticha na začátku (v sekundách)
+# 0.3s (300ms) je obvykle ideální pro ESP32
+PRE_ROLL_SILENCE = 0.3
+SAMPLE_RATE = 48000
+CHANNELS = 1
+WIDTH = 2  # 16-bit = 2 bajty
+
 class CartesiaTTSEntity(TextToSpeechEntity):
-    # Podporujeme změnu hlasu i modelu přes service call
     _attr_supported_options = ["voice", "model", "speed"]
     
     def __init__(self, client: AsyncCartesia, voices, voice_id: str, unique_id: str, language: str, name: str, speed: float = 1.0):
@@ -32,34 +40,49 @@ class CartesiaTTSEntity(TextToSpeechEntity):
         return self._language
         
     async def async_get_tts_audio(self, message: str, language: str, options: dict) -> TtsAudioType:
-        # Možnost přepsat nastavení v rámci volání služby
         voice_id = options.get("voice", self._voice_id)
-        # Sonic-3 se v API často volá 'sonic-multilingual' nebo 'sonic-3'
-        model = options.get("model", "sonic-3") 
+        model = options.get("model", "sonic-multilingual") 
         speed = options.get("speed", self._speed)
         
         try:
-            # Konstrukce nastavení hlasu a rychlosti
-            # Použijeme typ 'Any', abychom obešli striktní kontrolu Pylance, 
-            # protože __experimental_controls nemusí být v definici typu.
             voice_settings: Any = {
                 "mode": "id", 
                 "id": voice_id,
                 "__experimental_controls": {"speed": speed}
             }
 
+            # 1. Požádáme o RAW data (bez WAV hlavičky), abychom mohli manipulovat s bajty
             audio_iter = self._client.tts.bytes(
                 model_id=model,
                 transcript=message,
                 voice=voice_settings,
                 language=self._language,
-                output_format={"container": "wav", "encoding": "pcm_s16le", "sample_rate": 44100},
+                output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": SAMPLE_RATE},
             )
             
-            bytes_combined = b""
+            # 2. Stáhneme všechna data hlasu
+            raw_speech = b""
             async for chunk in audio_iter:
-                bytes_combined += chunk
-            return "wav", bytes_combined
+                raw_speech += chunk
+
+            # 3. Vygenerujeme ticho na začátek
+            # Počet bajtů = vzorkovací frekvence * délka ticha * kanály * bitová hloubka
+            silence_bytes_count = int(SAMPLE_RATE * PRE_ROLL_SILENCE * CHANNELS * WIDTH)
+            silence_data = b'\x00' * silence_bytes_count
+
+            # 4. Spojíme Ticho + Hlas
+            final_raw_data = silence_data + raw_speech
+
+            # 5. Zabalíme to do WAV kontejneru (Home Assistant potřebuje hlavičku)
+            # Vytvoříme soubor v paměti
+            buffer = io.BytesIO()
+            with wave.open(buffer, 'wb') as wav_file:
+                wav_file.setnchannels(CHANNELS)
+                wav_file.setsampwidth(WIDTH)
+                wav_file.setframerate(SAMPLE_RATE)
+                wav_file.writeframes(final_raw_data)
+            
+            return "wav", buffer.getvalue()
             
         except ApiError as exc:
             raise HomeAssistantError(f"Cartesia API Error: {exc}") from exc
@@ -67,10 +90,8 @@ class CartesiaTTSEntity(TextToSpeechEntity):
             raise HomeAssistantError(f"Unexpected Error: {exc}") from exc
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities):
-    # Načtení klienta z runtime_data
     data = getattr(config_entry, "runtime_data")
     
-    # Načtení nastavení z config entry
     api_key = config_entry.data[CONF_API_KEY]
     name = config_entry.data.get("name", "Cartesia TTS")
     language = config_entry.data.get("language", "en")
@@ -79,11 +100,9 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
     
     unique_id = config_entry.entry_id
     
-    # --- Načtení seznamu hlasů pro atributy entity ---
     cache_file = os.path.join(hass.config.config_dir, VOICES_CACHE_FILE)
     voices = []
     
-    # 1. Zkusíme cache
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r") as f:
@@ -97,7 +116,6 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
         except:
             pass
     
-    # 2. Pokud cache selhala nebo je prázdná, zkusíme API
     if not voices:
         try:
             voices_pager = await data.client.voices.list()
@@ -112,10 +130,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
                 if language in langs or "multilingual" in mode:
                     voices.append(Voice(getattr(v, 'id'), getattr(v, 'name')))
         except Exception:
-            # Fallback při chybě
             voices.append(Voice(voice_id, "Unknown Voice"))
 
-    # Přidání entity
     async_add_entities([
         CartesiaTTSEntity(
             client=data.client, 
