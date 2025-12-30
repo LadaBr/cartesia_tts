@@ -1,3 +1,4 @@
+from typing import Any  # <--- PŘIDÁNO PRO OPRAVU TYPOVÁNÍ
 from cartesia import AsyncCartesia
 from cartesia.core.api_error import ApiError
 from homeassistant.components.tts import TextToSpeechEntity, TtsAudioType, Voice
@@ -10,15 +11,17 @@ import json
 from .const import VOICES_CACHE_FILE
 
 class CartesiaTTSEntity(TextToSpeechEntity):
-    _attr_supported_options = ["voice", "model"]
+    # Podporujeme změnu hlasu i modelu přes service call
+    _attr_supported_options = ["voice", "model", "speed"]
     
-    def __init__(self, client: AsyncCartesia, voices, voice_id: str, unique_id: str, language: str, name: str):
+    def __init__(self, client: AsyncCartesia, voices, voice_id: str, unique_id: str, language: str, name: str, speed: float = 1.0):
         self._client = client
         self._voice_id = voice_id
         self._voices = voices
         self._attr_name = name
         self._attr_unique_id = unique_id
         self._language = language
+        self._speed = speed
         
     @property
     def supported_languages(self) -> list[str]:
@@ -29,56 +32,74 @@ class CartesiaTTSEntity(TextToSpeechEntity):
         return self._language
         
     async def async_get_tts_audio(self, message: str, language: str, options: dict) -> TtsAudioType:
+        # Možnost přepsat nastavení v rámci volání služby
         voice_id = options.get("voice", self._voice_id)
-        model = options.get("model", "sonic-3")
+        # Sonic-3 se v API často volá 'sonic-multilingual' nebo 'sonic-3'
+        model = options.get("model", "sonic-3") 
+        speed = options.get("speed", self._speed)
+        
         try:
+            # Konstrukce nastavení hlasu a rychlosti
+            # Použijeme typ 'Any', abychom obešli striktní kontrolu Pylance, 
+            # protože __experimental_controls nemusí být v definici typu.
+            voice_settings: Any = {
+                "mode": "id", 
+                "id": voice_id,
+                "__experimental_controls": {"speed": speed}
+            }
+
             audio_iter = self._client.tts.bytes(
                 model_id=model,
                 transcript=message,
-                voice={"mode": "id", "id": voice_id},
+                voice=voice_settings,
                 language=self._language,
                 output_format={"container": "wav", "encoding": "pcm_s16le", "sample_rate": 44100},
             )
+            
             bytes_combined = b""
             async for chunk in audio_iter:
                 bytes_combined += chunk
             return "wav", bytes_combined
+            
         except ApiError as exc:
-            raise HomeAssistantError(exc) from exc
+            raise HomeAssistantError(f"Cartesia API Error: {exc}") from exc
+        except Exception as exc:
+            raise HomeAssistantError(f"Unexpected Error: {exc}") from exc
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities):
-    data = getattr(config_entry, 'runtime_data')
-    api_key = config_entry.data[CONF_API_KEY]
-    entities = []
+    # Načtení klienta z runtime_data
+    data = getattr(config_entry, "runtime_data")
     
-    for i, entity_config in enumerate(data.entities):
-        language = entity_config["language"]
-        voice_id = entity_config["voice"]
-        name = entity_config["name"]
-        unique_id = f"{config_entry.entry_id}_{i}"
-        
-        # Fetch voices for this language
-        cache_file = os.path.join(hass.config.config_dir, VOICES_CACHE_FILE)
-        cache_key = api_key
-        
-        # Try to load from cache
-        voices = []
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, "r") as f:
-                    cache = json.load(f)
-                    if cache.get("api_key") == api_key:
-                        all_voices = cache.get("voices", [])
-                        # Filter for language
-                        for v in all_voices:
-                            langs = v["language"] if isinstance(v["language"], list) else [v["language"]]
-                            if language in langs or "multilingual" in v.get("mode", ""):
-                                voices.append(Voice(v["id"], v["name"]))
-            except:
-                pass
-        
-        if not voices:
-            # Fetch from API if not cached
+    # Načtení nastavení z config entry
+    api_key = config_entry.data[CONF_API_KEY]
+    name = config_entry.data.get("name", "Cartesia TTS")
+    language = config_entry.data.get("language", "en")
+    voice_id = config_entry.data.get("voice", "")
+    speed = config_entry.data.get("speed", 1.0)
+    
+    unique_id = config_entry.entry_id
+    
+    # --- Načtení seznamu hlasů pro atributy entity ---
+    cache_file = os.path.join(hass.config.config_dir, VOICES_CACHE_FILE)
+    voices = []
+    
+    # 1. Zkusíme cache
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                cache = json.load(f)
+                if cache.get("api_key") == api_key:
+                    all_voices = cache.get("voices", [])
+                    for v in all_voices:
+                        langs = v["language"] if isinstance(v["language"], list) else [v["language"]]
+                        if language in langs or "multilingual" in v.get("mode", ""):
+                            voices.append(Voice(v["id"], v["name"]))
+        except:
+            pass
+    
+    # 2. Pokud cache selhala nebo je prázdná, zkusíme API
+    if not voices:
+        try:
             voices_pager = await data.client.voices.list()
             all_voices = [v async for v in voices_pager]
             
@@ -86,9 +107,23 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
                 langs = getattr(v, "language", [])
                 if isinstance(langs, str):
                     langs = [langs]
-                if language in langs or "multilingual" in getattr(v, "mode", ""):
+                mode = getattr(v, "mode", "")
+                
+                if language in langs or "multilingual" in mode:
                     voices.append(Voice(getattr(v, 'id'), getattr(v, 'name')))
-        
-        entities.append(CartesiaTTSEntity(data.client, voices, voice_id, unique_id, language, name))
-    
-    async_add_entities(entities)
+        except Exception:
+            # Fallback při chybě
+            voices.append(Voice(voice_id, "Unknown Voice"))
+
+    # Přidání entity
+    async_add_entities([
+        CartesiaTTSEntity(
+            client=data.client, 
+            voices=voices, 
+            voice_id=voice_id, 
+            unique_id=unique_id, 
+            language=language, 
+            name=name, 
+            speed=speed
+        )
+    ])
