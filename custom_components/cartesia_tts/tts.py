@@ -1,4 +1,5 @@
-from typing import Any
+from typing import Any, AsyncGenerator
+from dataclasses import dataclass
 import os
 import json
 import io
@@ -27,6 +28,19 @@ PRE_ROLL_SILENCE = 0.3
 SAMPLE_RATE = 44100
 CHANNELS = 1
 WIDTH = 2
+
+@dataclass
+class TTSAudioRequest:
+    """Request for streaming TTS audio."""
+    language: str
+    options: dict[str, Any]
+    message_gen: AsyncGenerator[str, None]
+
+@dataclass
+class TTSAudioResponse:
+    """Response with streaming TTS audio."""
+    extension: str
+    data_gen: AsyncGenerator[bytes, None]
 
 class CartesiaTTSEntity(TextToSpeechEntity):
     """Implementace Cartesia TTS entity."""
@@ -62,20 +76,50 @@ class CartesiaTTSEntity(TextToSpeechEntity):
             return None
         return self._voices_list
 
-    async def async_get_tts_audio(self, message: str, language: str, options: dict[str, Any]) -> TtsAudioType:
-        """Generování audia s tichem na začátku."""
+    def _get_voice_settings(self, options: dict[str, Any]) -> tuple[Any, str, float]:
+        """Prepare voice settings for API call."""
         voice_id = options.get("voice", self._voice_id)
         speed = options.get("speed", self._speed)
         model = options.get("model", "sonic-3")
+        
+        voice_settings: Any = {
+            "mode": "id",
+            "id": voice_id,
+            "__experimental_controls": {"speed": float(speed)}
+        }
+        
+        return voice_settings, model, speed
+
+    def _create_silence_wav(self) -> bytes:
+        """Create pre-roll silence for ESP32 satellite wake-up."""
+        silence_bytes_count = int(SAMPLE_RATE * PRE_ROLL_SILENCE * CHANNELS * WIDTH)
+        silence_data = b'\x00' * silence_bytes_count
+        
+        buffer = io.BytesIO()
+        with wave.open(buffer, 'wb') as wav_file:
+            wav_file.setnchannels(CHANNELS)
+            wav_file.setsampwidth(WIDTH)
+            wav_file.setframerate(SAMPLE_RATE)
+            wav_file.writeframes(silence_data)
+        
+        return buffer.getvalue()
+
+    def _wrap_raw_audio_to_wav(self, raw_audio: bytes) -> bytes:
+        """Wrap raw PCM audio data into WAV container."""
+        buffer = io.BytesIO()
+        with wave.open(buffer, 'wb') as wav_file:
+            wav_file.setnchannels(CHANNELS)
+            wav_file.setsampwidth(WIDTH)
+            wav_file.setframerate(SAMPLE_RATE)
+            wav_file.writeframes(raw_audio)
+        
+        return buffer.getvalue()
+
+    async def async_get_tts_audio(self, message: str, language: str, options: dict[str, Any]) -> TtsAudioType:
+        """Generování audia s tichem na začátku."""
+        voice_settings, model, _ = self._get_voice_settings(options)
 
         try:
-            # Pylance fix pro experimentální parametry
-            voice_settings: Any = {
-                "mode": "id",
-                "id": voice_id,
-                "__experimental_controls": {"speed": float(speed)}
-            }
-
             audio_iter = self._client.tts.bytes(
                 model_id=model,
                 transcript=message,
@@ -94,21 +138,58 @@ class CartesiaTTSEntity(TextToSpeechEntity):
             final_raw_data = silence_data + raw_speech
 
             # Zabalení do WAV
-            buffer = io.BytesIO()
-            with wave.open(buffer, 'wb') as wav_file:
-                wav_file.setnchannels(CHANNELS)
-                wav_file.setsampwidth(WIDTH)
-                wav_file.setframerate(SAMPLE_RATE)
-                wav_file.writeframes(final_raw_data)
-
-            return "wav", buffer.getvalue()
+            return "wav", self._wrap_raw_audio_to_wav(final_raw_data)
 
         except ApiError as exc:
             _LOGGER.error("Cartesia API Error: %s", exc)
             return None, None
-        except Exception as exc:
-            _LOGGER.error("Unexpected Error in Cartesia TTS: %s", exc)
-            return None, None
+
+    async def async_stream_tts_audio(self, request: TTSAudioRequest) -> TTSAudioResponse:
+        """Stream TTS audio with real-time generation from LLM text chunks."""
+        voice_settings, model, _ = self._get_voice_settings(request.options)
+        
+        _LOGGER.debug("Starting streaming TTS for language: %s", request.language)
+
+        async def audio_generator() -> AsyncGenerator[bytes, None]:
+            """Generate audio chunks as they arrive."""
+            try:
+                # First yield pre-roll silence for ESP32 satellite wake-up
+                yield self._create_silence_wav()
+
+                # Collect full message from LLM stream
+                full_message = ""
+                async for text_chunk in request.message_gen:
+                    full_message += text_chunk
+                
+                if not full_message.strip():
+                    _LOGGER.warning("Empty message received in streaming TTS")
+                    return
+
+                # Stream audio from Cartesia
+                audio_iter = self._client.tts.bytes(
+                    model_id=model,
+                    transcript=full_message,
+                    voice=voice_settings,
+                    language=request.language,
+                    output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": SAMPLE_RATE},
+                )
+
+                # Stream audio chunks as they arrive
+                async for audio_chunk in audio_iter:
+                    if audio_chunk:
+                        yield self._wrap_raw_audio_to_wav(audio_chunk)
+
+            except ApiError as exc:
+                _LOGGER.error("Cartesia API Error in streaming: %s", exc)
+                raise HomeAssistantError(f"Cartesia streaming error: {exc}") from exc
+            except Exception as exc:
+                _LOGGER.error("Unexpected error in streaming TTS: %s", exc)
+                raise HomeAssistantError(f"Streaming TTS error: {exc}") from exc
+
+        return TTSAudioResponse(
+            extension="wav",
+            data_gen=audio_generator()
+        )
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities):
     """Nastavení entity při startu integrace."""
@@ -117,7 +198,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
     api_key = config_entry.data[CONF_API_KEY]
     name = config_entry.data.get("name", "Cartesia TTS")
     language = config_entry.data.get("language", "cs")
-    voice_id = config_entry.data.get("voice")
+    voice_id = config_entry.data.get("voice", "")
     speed = config_entry.data.get("speed", 1.0)
     
     # Načtení hlasů pro Pipeline
