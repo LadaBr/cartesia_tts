@@ -1,0 +1,3 @@
+refresh_voices:
+  name: Refresh voices
+  description: Refreshes the cached list of voices from Cartesia API

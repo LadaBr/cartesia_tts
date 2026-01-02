@@ -15,10 +15,13 @@ async def get_all_voices(hass: HomeAssistant, api_key: str):
     # Zkusíme načíst z cache
     if os.path.exists(cache_file):
         try:
-            with open(cache_file, "r") as f:
-                cache = json.load(f)
-                if cache.get("api_key") == api_key:
-                    return cache.get("voices", [])
+            def _read_cache():
+                with open(cache_file, "r") as f:
+                    return json.load(f)
+            
+            cache = await hass.async_add_executor_job(_read_cache)
+            if cache.get("api_key") == api_key:
+                return cache.get("voices", [])
         except:
             pass
     
@@ -43,8 +46,11 @@ async def get_all_voices(hass: HomeAssistant, api_key: str):
     
     # Uložíme do cache
     try:
-        with open(cache_file, "w") as f:
-            json.dump({"api_key": api_key, "voices": voices_list}, f)
+        def _write_cache():
+            with open(cache_file, "w") as f:
+                json.dump({"api_key": api_key, "voices": voices_list}, f)
+        
+        await hass.async_add_executor_job(_write_cache)
     except:
         pass
     

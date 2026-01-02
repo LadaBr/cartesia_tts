@@ -117,9 +117,13 @@ class CartesiaTTSEntity(TextToSpeechEntity):
 
     async def async_get_tts_audio(self, message: str, language: str, options: dict[str, Any]) -> TtsAudioType:
         """Generování audia s tichem na začátku."""
+        _LOGGER.info("TTS Request - Message: '%s', Language: %s, Options: %s", message[:50], language, options)
+        
         voice_settings, model, _ = self._get_voice_settings(options)
+        _LOGGER.info("Voice settings - Model: %s, Voice ID: %s", model, voice_settings.get("id"))
 
         try:
+            _LOGGER.debug("Calling Cartesia API...")
             audio_iter = self._client.tts.bytes(
                 model_id=model,
                 transcript=message,
@@ -129,8 +133,12 @@ class CartesiaTTSEntity(TextToSpeechEntity):
             )
 
             raw_speech = b""
+            chunk_count = 0
             async for chunk in audio_iter:
                 raw_speech += chunk
+                chunk_count += 1
+            
+            _LOGGER.info("Received %d audio chunks, total bytes: %d", chunk_count, len(raw_speech))
 
             # Vložení ticha pro ESP32 (Wake-up delay)
             silence_bytes_count = int(SAMPLE_RATE * PRE_ROLL_SILENCE * CHANNELS * WIDTH)
@@ -138,10 +146,15 @@ class CartesiaTTSEntity(TextToSpeechEntity):
             final_raw_data = silence_data + raw_speech
 
             # Zabalení do WAV
-            return "wav", self._wrap_raw_audio_to_wav(final_raw_data)
+            wav_data = self._wrap_raw_audio_to_wav(final_raw_data)
+            _LOGGER.info("TTS audio generated successfully, WAV size: %d bytes", len(wav_data))
+            return "wav", wav_data
 
         except ApiError as exc:
             _LOGGER.error("Cartesia API Error: %s", exc)
+            return None, None
+        except Exception as exc:
+            _LOGGER.error("Unexpected error in TTS generation: %s", exc, exc_info=True)
             return None, None
 
     async def async_stream_tts_audio(self, request: TTSAudioRequest) -> TTSAudioResponse:
@@ -207,14 +220,17 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
 
     if os.path.exists(cache_file):
         try:
-            with open(cache_file, "r") as f:
-                cache = json.load(f)
-                if cache.get("api_key") == api_key:
-                    for v in cache.get("voices", []):
-                        v_langs = v["language"] if isinstance(v["language"], list) else [v["language"]]
-                        if language in v_langs or "multilingual" in v.get("mode", ""):
-                            # Tady vytváříme objekty Voice, které Pipeline vyžaduje
-                            voices_for_entity.append(Voice(v["id"], v["name"]))
+            def _read_cache():
+                with open(cache_file, "r") as f:
+                    return json.load(f)
+            
+            cache = await hass.async_add_executor_job(_read_cache)
+            if cache.get("api_key") == api_key:
+                for v in cache.get("voices", []):
+                    v_langs = v["language"] if isinstance(v["language"], list) else [v["language"]]
+                    if language in v_langs or "multilingual" in v.get("mode", ""):
+                        # Tady vytváříme objekty Voice, které Pipeline vyžaduje
+                        voices_for_entity.append(Voice(v["id"], v["name"]))
         except Exception as e:
             _LOGGER.error("Chyba při načítání cache hlasů: %s", e)
 
