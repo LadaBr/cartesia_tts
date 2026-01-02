@@ -116,45 +116,37 @@ class CartesiaTTSEntity(TextToSpeechEntity):
         return buffer.getvalue()
 
     async def async_get_tts_audio(self, message: str, language: str, options: dict[str, Any]) -> TtsAudioType:
-        """Generování audia s tichem na začátku."""
+        """Generování audia - používá streaming a sbírá výsledek."""
         _LOGGER.info("TTS Request - Message: '%s', Language: %s, Options: %s", message[:50], language, options)
         
-        voice_settings, model, _ = self._get_voice_settings(options)
-        _LOGGER.info("Voice settings - Model: %s, Voice ID: %s", model, voice_settings.get("id"))
-
         try:
-            _LOGGER.debug("Calling Cartesia API...")
-            audio_iter = self._client.tts.bytes(
-                model_id=model,
-                transcript=message,
-                voice=voice_settings,
-                language=self._language,
-                output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": SAMPLE_RATE},
+            # Create single-message generator
+            async def message_gen() -> AsyncGenerator[str, None]:
+                yield message
+            
+            # Use streaming method
+            request = TTSAudioRequest(
+                language=language,
+                options=options,
+                message_gen=message_gen()
             )
-
-            raw_speech = b""
+            
+            response = await self.async_stream_tts_audio(request)
+            
+            # Collect all audio chunks
+            audio_data = b""
             chunk_count = 0
-            async for chunk in audio_iter:
-                raw_speech += chunk
+            async for chunk in response.data_gen:
+                audio_data += chunk
                 chunk_count += 1
             
-            _LOGGER.info("Received %d audio chunks, total bytes: %d", chunk_count, len(raw_speech))
+            _LOGGER.info("Collected %d audio chunks, total bytes: %d", chunk_count, len(audio_data))
+            _LOGGER.info("TTS audio generated successfully")
+            
+            return response.extension, audio_data
 
-            # Vložení ticha pro ESP32 (Wake-up delay)
-            silence_bytes_count = int(SAMPLE_RATE * PRE_ROLL_SILENCE * CHANNELS * WIDTH)
-            silence_data = b'\x00' * silence_bytes_count
-            final_raw_data = silence_data + raw_speech
-
-            # Zabalení do WAV
-            wav_data = self._wrap_raw_audio_to_wav(final_raw_data)
-            _LOGGER.info("TTS audio generated successfully, WAV size: %d bytes", len(wav_data))
-            return "wav", wav_data
-
-        except ApiError as exc:
-            _LOGGER.error("Cartesia API Error: %s", exc)
-            return None, None
         except Exception as exc:
-            _LOGGER.error("Unexpected error in TTS generation: %s", exc, exc_info=True)
+            _LOGGER.error("Error in TTS generation: %s", exc, exc_info=True)
             return None, None
 
     async def async_stream_tts_audio(self, request: TTSAudioRequest) -> TTSAudioResponse:
@@ -166,9 +158,6 @@ class CartesiaTTSEntity(TextToSpeechEntity):
         async def audio_generator() -> AsyncGenerator[bytes, None]:
             """Generate audio chunks as they arrive."""
             try:
-                # First yield pre-roll silence for ESP32 satellite wake-up
-                yield self._create_silence_wav()
-
                 # Collect full message from LLM stream
                 full_message = ""
                 async for text_chunk in request.message_gen:
@@ -178,19 +167,21 @@ class CartesiaTTSEntity(TextToSpeechEntity):
                     _LOGGER.warning("Empty message received in streaming TTS")
                     return
 
+                _LOGGER.info("Streaming TTS for message: '%s...'", full_message[:50])
+
                 # Stream audio from Cartesia
                 audio_iter = self._client.tts.bytes(
                     model_id=model,
                     transcript=full_message,
                     voice=voice_settings,
                     language=request.language,
-                    output_format={"container": "raw", "encoding": "pcm_s16le", "sample_rate": SAMPLE_RATE},
+                    output_format={"container": "wav", "encoding": "pcm_s16le", "sample_rate": SAMPLE_RATE},
                 )
 
                 # Stream audio chunks as they arrive
                 async for audio_chunk in audio_iter:
                     if audio_chunk:
-                        yield self._wrap_raw_audio_to_wav(audio_chunk)
+                        yield audio_chunk
 
             except ApiError as exc:
                 _LOGGER.error("Cartesia API Error in streaming: %s", exc)
