@@ -4,7 +4,7 @@ import os
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_API_KEY, Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.httpx_client import get_async_client
+from homeassistant.helpers.httpx_client import get_async_client as get_httpx_client
 from .const import DOMAIN, VOICES_CACHE_FILE
 
 PLATFORMS = [Platform.TTS]
@@ -14,9 +14,9 @@ class CartesiaData:
     client: AsyncCartesia
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    httpx_client = get_async_client(hass)
-    
-    client = AsyncCartesia(api_key=entry.data[CONF_API_KEY], httpx_client=httpx_client)
+    httpx_client = get_httpx_client(hass)
+
+    client = AsyncCartesia(api_key=entry.data[CONF_API_KEY], http_client=httpx_client)
     
     setattr(entry, "runtime_data", CartesiaData(client=client))
     

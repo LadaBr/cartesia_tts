@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show homeassistant)",
+      "WebFetch(domain:github.com)",
+      "Bash(pip show cartesia)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:www.home-assistant.io)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(pip install --upgrade cartesia)",
+      "Bash(python -c \":*)",
+      "Bash(python:*)",
+      "Bash(pip install --upgrade homeassistant)",
+      "Bash(pip install homeassistant --upgrade)",
+      "Bash(pip install \"homeassistant>=2026.2\" --upgrade --force-reinstall --no-deps)",
+      "Bash(pip install \"homeassistant>=2026.2\" cartesia)",
+      "Bash(pip show homeassistant cartesia)",
+      "Bash(pip install mutagen)",
+      "Bash(pip install ha-ffmpeg)",
+      "Bash(pip install pyright)"
+    ]
+  }
+}

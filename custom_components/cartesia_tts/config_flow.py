@@ -3,9 +3,9 @@ import voluptuous as vol
 import os
 import json
 from homeassistant import config_entries
-from homeassistant.const import CONF_API_KEY, CONF_NAME
+from homeassistant.const import CONF_API_KEY
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.httpx_client import get_async_client
+from homeassistant.helpers.httpx_client import get_async_client as get_httpx_client
 from .const import VOICES_CACHE_FILE
 
 async def get_all_voices(hass: HomeAssistant, api_key: str):
@@ -26,9 +26,9 @@ async def get_all_voices(hass: HomeAssistant, api_key: str):
             pass
     
     # Stáhneme z API
-    httpx_client = get_async_client(hass)
+    httpx_client = get_httpx_client(hass)
     try:
-        client = AsyncCartesia(api_key=api_key, httpx_client=httpx_client)
+        client = AsyncCartesia(api_key=api_key, http_client=httpx_client)
         voices_pager = await client.voices.list()
         voices = [v async for v in voices_pager]
     except Exception:
@@ -37,11 +37,10 @@ async def get_all_voices(hass: HomeAssistant, api_key: str):
     voices_list = []
     for v in voices:
         voices_list.append({
-            "id": getattr(v, 'id'),
-            "name": getattr(v, 'name'),
-            "language": getattr(v, 'language', []),
-            "is_custom": getattr(v, 'is_custom', False),
-            "mode": getattr(v, 'mode', ""),
+            "id": v.id,
+            "name": v.name,
+            "language": v.language,
+            "gender": v.gender or "",
         })
     
     # Uložíme do cache
@@ -58,14 +57,14 @@ async def get_all_voices(hass: HomeAssistant, api_key: str):
 
 def _get_form_options(voices):
     """Pomocná funkce pro přípravu dat do formulářů."""
-    languages = sorted(set(lang for v in voices for lang in (v["language"] if isinstance(v["language"], list) else [v["language"]])))
-    voices_options = {v["id"]: f"{v['name']} ({v['mode']})" for v in voices}
+    languages = sorted(set(v["language"] for v in voices if v.get("language")))
+    voices_options = {v["id"]: v["name"] for v in voices}
     
     default_lang = "cs" if "cs" in languages else (languages[0] if languages else "")
     default_voice = None
     if voices_options:
         # Zkusíme najít hlas pro defaultní jazyk
-        default_voice = next((v["id"] for v in voices if default_lang in (v["language"] if isinstance(v["language"], list) else [v["language"]])), list(voices_options.keys())[0])
+        default_voice = next((v["id"] for v in voices if v.get("language") == default_lang), list(voices_options.keys())[0])
 
     return languages, voices_options, default_lang, default_voice
 

@@ -1,19 +1,20 @@
-from typing import Any, AsyncGenerator
-from dataclasses import dataclass
+from typing import Any
+from collections.abc import AsyncGenerator
+from functools import cached_property
 import os
 import json
 import io
 import wave
 import logging
 
-from cartesia import AsyncCartesia
-from cartesia.core.api_error import ApiError
+from cartesia import AsyncCartesia, APIError
 
 from homeassistant.components.tts import (
     TextToSpeechEntity,
     TtsAudioType,
     Voice,
 )
+from homeassistant.components.tts.entity import TTSAudioRequest, TTSAudioResponse
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_API_KEY
 from homeassistant.core import HomeAssistant, callback
@@ -29,19 +30,6 @@ SAMPLE_RATE = 44100
 CHANNELS = 1
 WIDTH = 2
 
-@dataclass
-class TTSAudioRequest:
-    """Request for streaming TTS audio."""
-    language: str
-    options: dict[str, Any]
-    message_gen: AsyncGenerator[str, None]
-
-@dataclass
-class TTSAudioResponse:
-    """Response with streaming TTS audio."""
-    extension: str
-    data_gen: AsyncGenerator[bytes, None]
-
 class CartesiaTTSEntity(TextToSpeechEntity):
     """Implementace Cartesia TTS entity."""
 
@@ -54,15 +42,15 @@ class CartesiaTTSEntity(TextToSpeechEntity):
         self._language = language
         self._speed = speed
 
-    @property
+    @cached_property
     def supported_languages(self) -> list[str]:
         return [self._language]
 
-    @property
+    @cached_property
     def default_language(self) -> str:
         return self._language
 
-    @property
+    @cached_property
     def supported_options(self) -> list[str]:
         """Seznam podporovaných voleb pro tts.speak."""
         return ["voice", "speed", "model"]
@@ -76,19 +64,13 @@ class CartesiaTTSEntity(TextToSpeechEntity):
             return None
         return self._voices_list
 
-    def _get_voice_settings(self, options: dict[str, Any]) -> tuple[Any, str, float]:
+    def _get_voice_settings(self, options: dict[str, Any]) -> tuple[dict[str, str], str, float]:
         """Prepare voice settings for API call."""
         voice_id = options.get("voice", self._voice_id)
         speed = options.get("speed", self._speed)
         model = options.get("model", "sonic-3")
-        
-        voice_settings: Any = {
-            "mode": "id",
-            "id": voice_id,
-            "__experimental_controls": {"speed": float(speed)}
-        }
-        
-        return voice_settings, model, speed
+
+        return {"mode": "id", "id": voice_id}, model, float(speed)
 
     def _create_silence_wav(self) -> bytes:
         """Create pre-roll silence for ESP32 satellite wake-up."""
@@ -151,7 +133,7 @@ class CartesiaTTSEntity(TextToSpeechEntity):
 
     async def async_stream_tts_audio(self, request: TTSAudioRequest) -> TTSAudioResponse:
         """Stream TTS audio with real-time generation from LLM text chunks."""
-        voice_settings, model, _ = self._get_voice_settings(request.options)
+        voice_settings, model, speed = self._get_voice_settings(request.options)
         
         _LOGGER.debug("Starting streaming TTS for language: %s", request.language)
 
@@ -162,28 +144,29 @@ class CartesiaTTSEntity(TextToSpeechEntity):
                 full_message = ""
                 async for text_chunk in request.message_gen:
                     full_message += text_chunk
-                
+
                 if not full_message.strip():
                     _LOGGER.warning("Empty message received in streaming TTS")
                     return
 
                 _LOGGER.info("Streaming TTS for message: '%s...'", full_message[:50])
 
-                # Stream audio from Cartesia
-                audio_iter = self._client.tts.bytes(
+                # Generate audio from Cartesia
+                response = await self._client.tts.generate(
                     model_id=model,
                     transcript=full_message,
-                    voice=voice_settings,
-                    language=request.language,
+                    voice={"mode": "id", "id": voice_settings["id"]},
+                    language=request.language,  # type: ignore[arg-type]
                     output_format={"container": "wav", "encoding": "pcm_s16le", "sample_rate": SAMPLE_RATE},
+                    generation_config={"speed": speed},
                 )
 
                 # Stream audio chunks as they arrive
-                async for audio_chunk in audio_iter:
+                async for audio_chunk in response.iter_bytes():
                     if audio_chunk:
                         yield audio_chunk
 
-            except ApiError as exc:
+            except APIError as exc:
                 _LOGGER.error("Cartesia API Error in streaming: %s", exc)
                 raise HomeAssistantError(f"Cartesia streaming error: {exc}") from exc
             except Exception as exc:
@@ -218,9 +201,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
             cache = await hass.async_add_executor_job(_read_cache)
             if cache.get("api_key") == api_key:
                 for v in cache.get("voices", []):
-                    v_langs = v["language"] if isinstance(v["language"], list) else [v["language"]]
-                    if language in v_langs or "multilingual" in v.get("mode", ""):
-                        # Tady vytváříme objekty Voice, které Pipeline vyžaduje
+                    if v.get("language") == language:
                         voices_for_entity.append(Voice(v["id"], v["name"]))
         except Exception as e:
             _LOGGER.error("Chyba při načítání cache hlasů: %s", e)
